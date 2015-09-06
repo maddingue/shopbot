@@ -1,0 +1,543 @@
+#!/opt/perl/current/bin/perl
+use v5.14;
+use utf8;
+use strict;
+use warnings;
+
+use AnyEvent;
+use AnyEvent::HTTP;
+use Anyevent::IRC::Client;
+use AnyEvent::IRC::Util qw< rfc_code_to_name >;
+use Config::IniFiles;
+use Data::Dump          qw< dd pp >;
+use Encode;
+use Future;
+use Getopt::Long        qw< GetOptionsFromArray >;
+use JSON::XS;
+use POSIX               qw< round >;
+use URI::Escape;
+
+
+$::PROGRAM = "shopbot";
+$::VERSION = "0.20";
+
+
+use constant {
+    HUMBLE_STORE_GAME_URL => "humblebundle.com/store/p/%s",
+    HUMBLE_STORE_SEARCH_URL
+        => "https://www.humblebundle.com/store/api?request=1&page_size=5"
+         . "&search=%s&sort=bestselling&page=0",
+
+    GOG_GAME_URL => "gog.com%s",
+    GOG_SEARCH_URL
+        => "http://www.gog.com/games/ajax/filtered?limit=4&search=%s",
+
+    GMG_GAME_URL => "greenmangaming.com%s",
+    GMG_SEARCH_URL
+        => "http://www.greenmangaming.com/quicksearch/?q=%s",
+
+    STEAM_GAME_URL => "store.steampowered.com/app/%d/",
+    STEAM_APP_LIST_URL
+        => "http://api.steampowered.com/ISteamApps/GetAppList/v0002/",
+    STEAM_APP_DETAILS_URL
+        => "http://store.steampowered.com/api/appdetails?appids=%d"
+         . "&filters=type,name,price_overview,platforms",
+};
+
+use constant ALL_STORES => qw< steam humble gog >;
+
+my $user_agent = "$::PROGRAM/$::VERSION (http://twitch.tv/shopbot)";
+
+my %handler = (
+    help    => \&cmd_help,
+    humble  => \&cmd_humble,
+    gog     => \&cmd_gog,
+    gmg     => \&cmd_greenmangaming,
+    steam   => \&cmd_steam,
+);
+
+my %x = (
+    EUR     => "€",
+    JPY     => "¥",
+    USD     => '$',
+);
+
+my %cache;
+my %steam_apps;
+
+my %shop_name = (
+    humble  => "Humble Store",
+    gog     => "GOG",
+    gmg     => "Greenman Gaming",
+    steam   => "Steam",
+);
+
+
+MAIN: {
+    main(@ARGV), exit unless caller();
+}
+
+
+#
+# main()
+# ----
+sub main {
+    # default options
+    my %options;
+
+    # parse command line options
+    GetOptionsFromArray(\@_, \%options, qw{
+        config|c=s  debug!
+    });
+
+    # read configuration file
+    my $config = Config::IniFiles->new(-file => $options{config});
+
+    # fetch Steam apps list
+    http_request
+        GET => STEAM_APP_LIST_URL,
+        headers => {
+            "User-Agent"    => $user_agent,
+        },
+        sub {
+            my ($body, $headers) = @_;
+            my $struct = eval { decode_json($body // "{}") } // {};
+            %steam_apps = map {
+                (my $tag = lc $_->{name}) =~ s/\W//g;
+                $tag => { id => $_->{appid}, name => $_->{name} }
+            } @{ $struct->{applist}{apps} };
+        }
+    ;
+
+    # create the IRC client
+    my $cv = AnyEvent->condvar;
+    my $irc = AnyEvent::IRC::Client->new;
+
+    $irc->reg_cb(connect => sub {
+        my ($self, $err) = @_;
+        die $err if $err;
+        say "connected to $self->{host}:$self->{port}";
+        $self->{config} = $config;
+    });
+
+    $irc->reg_cb(registered => sub { say "registered as $_[0]{nick}" });
+    $irc->reg_cb(disconnect => sub { say "disconnect"; $cv->broadcast });
+
+    if ($options{debug}) {
+        $irc->reg_cb(debug_send => sub { shift; say ">>> @_" });
+        $irc->reg_cb(debug_recv => sub {
+            shift; say "<<< $_[0]{command} @{$_[0]{params}} "
+        });
+    }
+
+    $irc->reg_cb(error => sub {
+        my ($self, $code, $message, $ircmsg) = @_;
+        say "error $code (", rfc_code_to_name($code), ") $message";
+        #$cv->broadcast;
+    });
+
+    $irc->reg_cb(publicmsg => \&handle_public_msg);
+    $irc->reg_cb(privmsg => \&handle_priv_msg);
+
+    $irc->ctcp_auto_reply(VERSION => [VERSION => "$::PROGRAM:$::VERSION:Perl"]);
+    $irc->ctcp_auto_reply(PING => sub { [ PING => $_[4] ] });
+
+    my @channels = grep { defined && length }
+        split /,/, $config->val(irc => "channels");
+
+    for my $chan (@channels) {
+        $irc->send_srv(JOIN => $chan);
+        #$irc->send_chan($chan, "PRIVMSG", $chan, "pouet");
+    }
+
+    $irc->connect(
+        $config->val(irc => "host"),
+        $config->val(irc => "port", 6667),
+        {
+            nick => $config->val(irc => "nick", $::PROGRAM),
+            real => $config->val(irc => "real", "ShopBot"),
+            password => $config->val(irc => "pass"),
+        }
+    );
+
+    $cv->wait;
+}
+
+
+#
+# handle_public_msg()
+# -----------------
+sub handle_public_msg {
+    my ($self, $channel, $ircmsg) = @_;
+    my $msg = $ircmsg->{params}[1];
+    #say "public <<< [$channel] $msg";
+
+    # parse input text
+    if ($msg =~ /!([a-zA-Z]+)(?: +(.+))?$/) {
+        # in case of a known command, extract arguments..
+        my $cmd  = $1;
+        my @args = grep { defined && length } split /\s+/, $2 // "";
+        (my $requested = lc join "", @args) =~ s/\W//g;
+
+        if ($cache{"$cmd:$requested"}) {
+            # CACHE HIT
+            $self->send_chan($channel, "PRIVMSG", $channel,
+                $cache{"$cmd:$requested"});
+            return
+        }
+
+        # CACHE MISS... we need to request the store
+
+        # callback for crafting the answer
+        my $cb = sub {
+            return unless $_[0];
+            my ($game) = @_;
+            my $response;
+
+            if ($game->{text}) {
+                $response = $game->{text};
+            }
+            elsif ($game->{not_found}) {
+                $response = "pas de résultat pour « $game->{name} »";
+            }
+            else {
+                my $ea = $game->{earlyaccess} ? " en accès anticipé" : "";
+                $response = "$game->{name}, disponible$ea sur $game->{platforms} "
+                          . "au prix de $game->{price} $game->{currency}";
+                $response .= " ($game->{url})"
+                    if $self->{config}->val(shopbot => "url")
+            }
+
+            my $bytes = encode_utf8 $response;
+            $cache{"$cmd:$requested"} = $bytes;
+            say "public >>> [$channel] $bytes";
+            $self->send_chan($channel, "PRIVMSG", $channel, $bytes);
+        };
+
+        # .. and execute it
+        if ($handler{$cmd}) {
+            eval { $handler{$cmd}->($self, $cb, @args) };
+        }
+    }
+    elsif ($msg =~ /^\s*(?i:$self->{nick})\W*(.+)$/) {
+        # when directly addressed, the text is a game name
+        # to look for in all the stores
+        my @args = grep { defined && length } split /\s+/, $1 // "";
+        my $query = join "", @args;
+        (my $requested = lc $query) =~ s/\W//g;
+        my @results;
+
+        # is the request already answered in the cache?
+        if ($cache{$requested}) {
+            # CACHE HIT
+            $self->send_chan($channel, "PRIVMSG", $channel, $cache{$requested});
+            return
+        }
+
+        # CACHE MISS... we need to request all the stores
+
+        # prepare a merge point using as many Future objects as store requests
+        my %subfuture = map { $_ => Future->new } ALL_STORES;
+        my $mp = Future->wait_all(values %subfuture);
+
+        $mp->on_ready(sub {
+            my %info;
+
+            for my $product (@results) {
+                next if $product->{not_found};
+                my $nametag = $product->{name};
+                $nametag = lc $product->{name};
+                $nametag =~ s/\W//g;
+                next unless $nametag =~ /^$requested/;
+                $info{name} //= $product->{name};
+                $info{platforms} //= $product->{platforms};
+                $info{earlyaccess} //= $product->{earlyaccess};
+                $info{price}{ $product->{store} }
+                    = "$product->{price} $product->{currency}";
+                $info{url}{ $product->{store} } = $product->{url};
+            }
+
+            my @prices;
+
+            for my $store (keys %{ $info{price} }) {
+                push @prices, "à $info{price}{$store} sur $shop_name{$store}";
+            }
+
+            # build the answer string
+            my $ea = $info{earlyaccess} ? " en accès anticipé" : "";
+            my $response;
+
+            if (@prices) {
+                $response = "$info{name}, disponible$ea pour $info{platforms} "
+                          . join ", ", @prices;
+            }
+            else {
+                $response = "pas de résultat pour « $query »";
+            }
+
+            my $bytes = encode_utf8 $response;
+            $cache{$requested} = $bytes;
+            say "public >>> [$channel] $bytes";
+            $self->send_chan($channel, "PRIVMSG", $channel, $bytes);
+        });
+
+        for my $store (ALL_STORES) {
+            my $cb = sub {
+                push @results, $_[0];
+                $subfuture{$store}->done;
+                $mp->is_ready;
+            };
+            eval { $handler{$store}->($self, $cb, @args) };
+        }
+
+    }
+}
+
+
+#
+# handle_priv_msg()
+# ---------------
+# Note: as far as I can tell, there are no private channels on Twitch;
+#       /w is handled by another way
+#
+sub handle_priv_msg {
+    my ($self, $nick, $ircmsg) = @_;
+    my $msg = $ircmsg->{params}[1];
+    say "priv <<< [$nick] $msg";
+
+    # ...
+}
+
+
+#
+# cmd_help()
+# --------
+sub cmd_help {
+    my ($self, $cb, @args) = @_;
+    my $help = "commandes reconnues : " . join ", ", map "!$_", keys %handler;
+    $cb->({ text => $help });
+}
+
+
+#
+# cmd_humble()
+# ----------
+sub cmd_humble {
+    my ($self, $cb, @args) = @_;
+    my $name = join " ", @args;
+    say "- humble: '$name'";
+    return unless $name;
+
+    my $url = sprintf HUMBLE_STORE_SEARCH_URL, uri_escape($name);
+
+    http_request
+        GET => $url,
+        headers => {
+            "User-Agent"        => $user_agent,
+            "X-Requested-With"  => "XMLHttpRequest"
+        },
+        sub {
+            my ($body, $headers) = @_;
+            my $struct = eval { decode_json($body // "{}") } // {};
+            my %game = ( not_found => 1, name => $name );
+            my $strict = 1;
+
+            PASS:
+            for (1..2) {
+                for my $product (@{ $struct->{results} }) {
+                    next if $strict and not $product->{human_name} =~ /^$name/i;
+                    my $platforms = join ", ", map ucfirst,
+                                        @{ $product->{platforms} };
+                    my $price = round($product->{current_price}[0] * 10) / 10;
+
+                    %game = (
+                        store       => "humble",
+                        name        => $product->{human_name},
+                        price       => $price,
+                        currency    => $x{ $product->{current_price}[1] },
+                        platforms   => $platforms,
+                        url         => sprintf(HUMBLE_STORE_GAME_URL, $product->{machine_name}),
+                    );
+
+                    $game{earlyaccess} = 1
+                        if "earlyaccess" eq ($product->{cta_badge} // "");
+
+                    $game{name} =~ s/[®™]//g;
+
+                    last
+                }
+
+                $strict = 0;
+            }
+
+            $cb->(\%game);
+        }
+    ;
+}
+
+
+#
+# cmd_gog()
+# -------
+sub cmd_gog {
+    my ($self, $cb, @args) = @_;
+    my $name = join " ", @args;
+    say "- gog: '$name'";
+    return unless $name;
+
+    my $url = sprintf GOG_SEARCH_URL, uri_escape($name);
+
+    http_request
+        GET => $url,
+        headers => {
+            "User-Agent"        => $user_agent,
+            "X-Requested-With"  => "XMLHttpRequest"
+        },
+        sub {
+            my ($body, $headers) = @_;
+            my $struct = eval { decode_json($body // "{}") } // {};
+            my %game = ( not_found => 1, name => $name );
+            my $strict = 1;
+
+            PASS:
+            for (1..2) {
+                for my $product (@{ $struct->{products} }) {
+                    next if $strict and not $product->{title} =~ /^$name/i;
+                    my $platforms = join ", ", grep $product->{worksOn}{$_},
+                        keys %{ $product->{worksOn} };
+                    my $price = round($product->{price}{finalAmount} * 10) / 10;
+
+                    %game = (
+                        store       => "gog",
+                        name        => $product->{title},
+                        price       => $price,
+                        currency    => $product->{price}{symbol},
+                        platforms   => $platforms,
+                        url         => sprintf(GOG_GAME_URL, $product->{url}),
+                    );
+
+                    $game{name} =~ s/[®™]//g;
+
+                    last PASS
+                }
+
+                $strict = 0;
+            }
+
+            $cb->(\%game);
+        }
+    ;
+}
+
+
+#
+# cmd_greenmangaming()
+# ------------------
+sub cmd_greenmangaming {
+    my ($self, $cb, @args) = @_;
+    my $name = join " ", @args;
+    say "- greenmangaming: '$name'";
+    return unless $name;
+
+    my $url = sprintf GMG_SEARCH_URL, uri_escape($name);
+
+    http_request
+        GET => $url,
+        headers => {
+            "User-Agent"        => $user_agent,
+            "X-Requested-With"  => "XMLHttpRequest"
+        },
+        sub {
+            my ($body, $headers) = @_;
+            my $struct = eval { decode_json($body // "{}") } // {};
+            my %game = ( not_found => 1, name => $name );
+            my $strict = 1;
+
+            PASS:
+            for (1..2) {
+                for my $product (@$struct) {
+                    next if $strict and not $product->{name} =~ /^$name/i;
+                    my ($price, $currency) = split /\s+/, $product->{price};
+                    $price = round($price * 10) / 10;
+
+                    %game = (
+                        store       => "gmg",
+                        name        => $product->{name},
+                        price       => $price,
+                        currency    => $currency,
+                        url         => sprintf(GMG_GAME_URL, $product->{url}),
+                    );
+
+                    $game{name} =~ s/[®™]//g;
+
+                    last PASS
+                }
+
+                $strict = 0;
+            }
+
+            $cb->(\%game);
+        }
+    ;
+}
+
+
+#
+# cmd_steam()
+# ---------
+sub cmd_steam {
+    my ($self, $cb, @args) = @_;
+    my $name = join " ", @args;
+    say "- steam: '$name'";
+    return unless $name;
+
+    # Steam doesn't have an API where you can search games (or now, movies)
+    # by name; instead, we fetch the whole list of apps and manually look
+    # the game in this list
+    my @results = map { $steam_apps{$_} } grep { /^$name/i } keys %steam_apps;
+    say "  results: ", pp \@results;
+
+    if (not @results) {
+        $cb->({ not_found => 1, name => $name });
+        return
+    }
+
+    # fetch the details of the game
+    my $appid   = $results[0]{id};
+    my $appname = $results[0]{name};
+    my $url = sprintf STEAM_APP_DETAILS_URL, $appid;
+
+    http_request
+        GET => $url,
+        headers => {
+            "User-Agent"        => $user_agent,
+            "X-Requested-With"  => "XMLHttpRequest"
+        },
+        sub {
+            my ($body, $headers) = @_;
+            my $struct = eval { decode_json($body // "{}") } // {};
+            my %game = ( not_found => 1, name => $name );
+
+            if ($struct->{$appid}{success}) {
+                my $app = $struct->{$appid}{data};
+                my $platforms = join ", ", map ucfirst,
+                    grep $app->{platforms}{$_}, keys %{ $app->{platforms} };
+                my $price = round($app->{price_overview}{final} / 10) / 10;
+
+                %game = (
+                    store       => "steam",
+                    name        => $appname,
+                    price       => $price,
+                    currency    => $app->{price_overview}{currency},
+                    platforms   => $platforms,
+                    url         => sprintf(STEAM_GAME_URL, $appid),
+                );
+
+                $game{name} =~ s/[®™]//g;
+            }
+
+            $cb->(\%game);
+        }
+    ;
+}
+
